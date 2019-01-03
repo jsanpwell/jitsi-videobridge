@@ -25,6 +25,7 @@ import org.jitsi.service.neomedia.codec.*;
 import org.jitsi.service.neomedia.rtp.*;
 import org.jitsi.util.*;
 import org.jitsi.videobridge.*;
+import org.jitsi.videobridge.cc.vp8.*;
 
 import java.util.*;
 import java.util.concurrent.*;
@@ -73,7 +74,7 @@ import java.util.concurrent.*;
  * This hierarchy allows for fine-grained filtering up to the {@link FrameDesc}
  * level.
  *
- * The decision of whether to accept or drop a specific RTP packet of a
+ * The decision of whether to project or drop a specific RTP packet of a
  * specific {@link FrameDesc} of a specific {@link MediaStreamTrackDesc}
  * depends on the bitrate allocation of the specific {@link
  * MediaStreamTrackDesc} and on the state of the bitstream that is produced by
@@ -232,17 +233,17 @@ public class BitrateController
     private final VideoChannel dest;
 
     /**
-     * The {@link SimulcastController}s that this instance is managing, keyed
+     * The {@link AdaptiveTrackProjection}s that this instance is managing, keyed
      * by the SSRCs of the associated {@link MediaStreamTrackDesc}.
      */
-    private final Map<Long, SimulcastController>
-        ssrcToSimulcastController = new ConcurrentHashMap<>();
+    private final Map<Long, AdaptiveTrackProjection>
+        adaptiveTrackProjectionMap = new ConcurrentHashMap<>();
 
     /**
      * The {@link PacketTransformer} that handles incoming/outgoing RTP
      * packets for this {@link BitrateController} instance. Internally,
      * it delegates this responsibility to the appropriate media stream track
-     * bitrate controller ({@link SimulcastController}, etc).
+     * bitrate controller ({@link AdaptiveTrackProjection}, etc).
      */
     private final PacketTransformer rtpTransformer = new RTPTransformer();
 
@@ -250,7 +251,7 @@ public class BitrateController
      * The {@link PacketTransformer} that handles incoming/outgoing RTCP
      * packets for this {@link BitrateController} instance. Internally,
      * it delegates this responsibility to the appropriate media stream track
-     * bitrate controller ({@link SimulcastController}, etc).
+     * bitrate controller ({@link AdaptiveTrackProjection}, etc).
      */
     private final PacketTransformer rtcpTransformer = new RTCPTransformer();
 
@@ -295,7 +296,7 @@ public class BitrateController
     /**
      * The current padding parameters list for {@link #dest}.
      */
-    private List<SimulcastController> simulcastControllers;
+    private List<AdaptiveTrackProjection> adaptiveTrackProjections;
 
     /**
      * Initializes a new {@link BitrateController} instance which is to
@@ -368,9 +369,9 @@ public class BitrateController
      *
      * @return the current padding parameters list for {@link #dest}.
      */
-    List<SimulcastController> getSimulcastControllers()
+    List<AdaptiveTrackProjection> getAdaptiveTrackProjections()
     {
-        return simulcastControllers;
+        return adaptiveTrackProjections;
     }
 
     /**
@@ -390,10 +391,10 @@ public class BitrateController
             return false;
         }
 
-        SimulcastController simulcastController
-            = ssrcToSimulcastController.get(ssrc);
+        AdaptiveTrackProjection adaptiveTrackProjection
+            = adaptiveTrackProjectionMap.get(ssrc);
 
-        if (simulcastController == null)
+        if (adaptiveTrackProjection == null)
         {
             logger.warn(
                 "Dropping an RTP packet, because the SSRC has not " +
@@ -401,7 +402,7 @@ public class BitrateController
             return false;
         }
 
-        return simulcastController.accept(pkt);
+        return adaptiveTrackProjection.accept(pkt);
     }
 
     /**
@@ -524,10 +525,10 @@ public class BitrateController
         Set<String> conferenceEndpointIds = new HashSet<>();
 
         // Accumulators used for tracing purposes.
-        long totalIdealBps = 0, totalTargetBps = 0, totalCurrentBps = 0;
-        int totalIdealIdx = 0, totalTargetIdx = 0, totalCurrentIdx = 0;
+        long totalIdealBps = 0, totalTargetBps = 0;
+        int totalIdealIdx = 0, totalTargetIdx = 0;
 
-        List<SimulcastController> simulcastControllers = new ArrayList<>();
+        List<AdaptiveTrackProjection> adaptiveTrackProjections = new ArrayList<>();
         if (!ArrayUtils.isNullOrEmpty(trackBitrateAllocations))
         {
             for (TrackBitrateAllocation
@@ -540,10 +541,10 @@ public class BitrateController
                     trackIdealIdx = trackBitrateAllocation.getIdealIndex();
 
                 // Review this.
-                SimulcastController ctrl;
-                synchronized (ssrcToSimulcastController)
+                AdaptiveTrackProjection ctrl;
+                synchronized (adaptiveTrackProjectionMap)
                 {
-                    ctrl = ssrcToSimulcastController.get(ssrc & 0xFFFF_FFFFL);
+                    ctrl = adaptiveTrackProjectionMap.get(ssrc & 0xFFFF_FFFFL);
                     if (ctrl == null && trackBitrateAllocation.track != null)
                     {
                         RTPEncodingDesc[] rtpEncodings
@@ -551,20 +552,21 @@ public class BitrateController
 
                         if (!ArrayUtils.isNullOrEmpty(rtpEncodings))
                         {
-                            ctrl = new SimulcastController(
-                                this, trackBitrateAllocation.track);
+                            // FIXME not all streams are VP8
+                            ctrl = new VP8AdaptiveTrackProjection(
+                                trackBitrateAllocation.track);
 
                             // Route all encodings to the specified bitrate
                             // controller.
                             for (RTPEncodingDesc rtpEncoding : rtpEncodings)
                             {
-                                ssrcToSimulcastController.put(
+                                adaptiveTrackProjectionMap.put(
                                     rtpEncoding.getPrimarySSRC(), ctrl);
 
                                 long rtxSsrc = rtpEncoding.getSecondarySsrc(Constants.RTX);
                                 if (rtxSsrc != -1)
                                 {
-                                    ssrcToSimulcastController.put(
+                                    adaptiveTrackProjectionMap.put(
                                         rtxSsrc, ctrl);
                                 }
                             }
@@ -574,7 +576,7 @@ public class BitrateController
 
                 if (ctrl != null)
                 {
-                    simulcastControllers.add(ctrl);
+                    adaptiveTrackProjections.add(ctrl);
                     ctrl.setTargetIndex(trackTargetIdx);
                     ctrl.setIdealIndex(trackIdealIdx);
 
@@ -583,26 +585,20 @@ public class BitrateController
                     {
                         DiagnosticContext diagnosticContext
                             = destStream.getDiagnosticContext();
-                        int trackCurrentIdx = ctrl.getCurrentIndex();
                         long trackTargetBps
                             = trackBitrateAllocation.getTargetBitrate();
                         long trackIdealBps
                             = trackBitrateAllocation.getIdealBitrate();
-                        long trackCurrentBps = trackBitrateAllocation
-                            .track.getBps(trackCurrentIdx);
                         totalTargetBps += trackTargetBps;
                         totalIdealBps += trackIdealBps;
-                        totalCurrentBps += trackCurrentBps;
                         totalTargetIdx += trackTargetIdx;
                         totalIdealIdx += trackIdealIdx;
-                        totalCurrentIdx += trackCurrentIdx;
                         // time series that tracks how a media stream track
                         // gets forwarded to a specific receiver.
                         timeSeriesLogger.trace(diagnosticContext
                             .makeTimeSeriesPoint("track_quality", nowMs)
                             .addField("track_id",
                                 trackBitrateAllocation.track.hashCode())
-                            .addField("current_idx", trackCurrentIdx)
                             .addField("target_idx", trackTargetIdx)
                             .addField("ideal_idx", trackIdealIdx)
                             .addField("target_bps", trackTargetBps)
@@ -633,18 +629,17 @@ public class BitrateController
         }
         else
         {
-            for (SimulcastController simulcastController
-                : ssrcToSimulcastController.values())
+            for (AdaptiveTrackProjection adaptiveTrackProjection
+                : adaptiveTrackProjectionMap.values())
             {
                 if (enableVideoQualityTracing)
                 {
-                    totalCurrentIdx--;
                     totalIdealIdx--;
                     totalTargetIdx--;
                 }
-                simulcastController
+                adaptiveTrackProjection
                     .setTargetIndex(RTPEncodingDesc.SUSPENDED_INDEX);
-                simulcastController
+                adaptiveTrackProjection
                     .setIdealIndex(RTPEncodingDesc.SUSPENDED_INDEX);
             }
         }
@@ -655,17 +650,15 @@ public class BitrateController
                 = destStream.getDiagnosticContext();
             timeSeriesLogger.trace(diagnosticContext
                     .makeTimeSeriesPoint("video_quality", nowMs)
-                    .addField("total_current_idx", totalCurrentIdx)
                     .addField("total_target_idx", totalTargetIdx)
                     .addField("total_ideal_idx", totalIdealIdx)
                     .addField("available_bps", bweBps)
-                    .addField("total_current_bps", totalCurrentBps)
                     .addField("total_target_bps", totalTargetBps)
                     .addField("total_ideal_bps", totalIdealBps));
         }
 
         // The BandwidthProber will pick this up.
-        this.simulcastControllers = simulcastControllers;
+        this.adaptiveTrackProjections = adaptiveTrackProjections;
 
         if (!newForwardedEndpointIds.equals(oldForwardedEndpointIds))
         {
@@ -1114,7 +1107,7 @@ public class BitrateController
                         || encoding.getFrameRate() >= ONSTAGE_PREFERRED_FRAME_RATE)
                     {
                         ratesList.add(new RateSnapshot(
-                            encoding.getLastStableBitrateBps(), encoding));
+                            encoding.getLastStableBitrateBps(System.currentTimeMillis()), encoding));
                     }
 
                     if (encoding.getHeight() <= ONSTAGE_PREFERRED_HEIGHT)
@@ -1127,7 +1120,7 @@ public class BitrateController
                     // For the thumbnails, we consider all temporal layers of
                     // the low resolution stream.
                     ratesList.add(new RateSnapshot(
-                        encoding.getLastStableBitrateBps(), encoding));
+                        encoding.getLastStableBitrateBps(System.currentTimeMillis()), encoding));
                 }
             }
 
@@ -1237,7 +1230,7 @@ public class BitrateController
      * The {@link PacketTransformer} that handles incoming/outgoing RTP
      * packets for this {@link BitrateController} instance. Internally,
      * it delegates this responsibility to the appropriate media stream track
-     * bitrate controller ({@link SimulcastController}, etc).
+     * bitrate controller ({@link AdaptiveTrackProjection}, etc).
      */
     private class RTPTransformer
         implements PacketTransformer
@@ -1248,18 +1241,7 @@ public class BitrateController
         @Override
         public void close()
         {
-            for (SimulcastController simulcastController
-                : ssrcToSimulcastController.values())
-            {
-                try
-                {
-                    simulcastController.close();
-                }
-                catch (Exception ignored)
-                {
-
-                }
-            }
+            // no-op
         }
 
         /**
@@ -1297,39 +1279,37 @@ public class BitrateController
 
                 long ssrc = pkts[i].getSSRCAsLong();
 
-                SimulcastController simulcastController
-                    = ssrcToSimulcastController.get(ssrc);
+                AdaptiveTrackProjection adaptiveTrackProjection
+                    = adaptiveTrackProjectionMap.get(ssrc);
 
-                // FIXME properly support unannounced SSRCs.
-                RawPacket[] ret
-                    = simulcastController == null
-                    ? null : simulcastController.rtpTransform(pkts[i]);
-
-                if (ArrayUtils.isNullOrEmpty(ret))
+                if (adaptiveTrackProjection == null)
+                {
+                    pkts[i] = null;
+                    continue;
+                }
+                RawPacket[] ret = adaptiveTrackProjection.rewrite(pkts[i]);
+                if (ret == AdaptiveTrackProjection.DROP_PACKET_ARR)
                 {
                     pkts[i] = null;
                     continue;
                 }
 
-                pkts[i] = ret[0];
-                if (ret.length > 1)
+                if (ArrayUtils.isNullOrEmpty(ret))
                 {
-                    int extrasLen
-                        = ArrayUtils.isNullOrEmpty(extras) ? 0 : extras.length;
-
-                    RawPacket[] newExtras
-                        = new RawPacket[extrasLen + ret.length - 1];
-
-                    System.arraycopy(
-                        ret, 1, newExtras, extrasLen, ret.length - 1);
-
-                    if (extrasLen > 0)
-                    {
-                        System.arraycopy(extras, 0, newExtras, 0, extrasLen);
-                    }
-
-                    extras = newExtras;
+                    continue;
                 }
+
+                int extrasLen
+                    = ArrayUtils.isNullOrEmpty(extras) ? 0 : extras.length;
+                RawPacket[] newExtras = new RawPacket[extrasLen + ret.length];
+                System.arraycopy(ret, 0, newExtras, extrasLen, ret.length);
+
+                if (extrasLen > 0)
+                {
+                    System.arraycopy(extras, 0, newExtras, 0, extrasLen);
+                }
+
+                extras = newExtras;
             }
 
             return ArrayUtils.concat(pkts, extras);
@@ -1340,7 +1320,7 @@ public class BitrateController
      * The {@link PacketTransformer} that handles incoming/outgoing RTCP
      * packets for this {@link BitrateController} instance. Internally,
      * it delegates this responsibility to the appropriate media stream track
-     * bitrate controller ({@link SimulcastController}, etc).
+     * bitrate controller ({@link AdaptiveTrackProjection}, etc).
      */
     private class RTCPTransformer
         extends SinglePacketTransformerAdapter
@@ -1365,11 +1345,19 @@ public class BitrateController
                 return pkt;
             }
 
-            SimulcastController simulcastController
-                = ssrcToSimulcastController.get(ssrc);
+            AdaptiveTrackProjection adaptiveTrackProjection
+                = adaptiveTrackProjectionMap.get(ssrc);
 
-            return simulcastController == null
-                    ? pkt : simulcastController.rtcpTransform(pkt);
+            if (adaptiveTrackProjection != null)
+            {
+                RawPacket[] ret = adaptiveTrackProjection.rewrite(pkt);
+                if (ret == AdaptiveTrackProjection.DROP_PACKET_ARR)
+                {
+                    return null;
+                }
+            }
+
+            return pkt;
         }
     }
 }
